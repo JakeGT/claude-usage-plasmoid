@@ -3,11 +3,11 @@
     "KPlugin": {
         "Id": "org.kde.claudeusage",
         "Name": "Claude Code Usage",
-        "Description": "Plan limits, token spend, rolling 5-hour block and burn rate for Claude Code",
+        "Description": "Plan limits with pace markers, rolling 5-hour block, daily spend by model and recent sessions for Claude Code",
         "Icon": "utilities-system-monitor",
         "Category": "System Information",
         "License": "MIT",
-        "Version": "1.1",
+        "Version": "1.2",
         "Authors": [
             {
                 "Name": "jtalling"

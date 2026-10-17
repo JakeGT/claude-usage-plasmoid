@@ -11,6 +11,7 @@ Kirigami.FormLayout {
     property alias cfg_weeklyCostLimit: weeklyCostLimit.value
     property alias cfg_showLimits: showLimits.checked
     property alias cfg_showLimitInPanel: showLimitInPanel.checked
+    property alias cfg_showChart: showChart.checked
     property alias cfg_showModels: showModels.checked
     property alias cfg_showSessions: showSessions.checked
 
@@ -87,6 +88,11 @@ Kirigami.FormLayout {
         id: showLimitInPanel
         text: i18n("Session limit % in the panel")
         enabled: showLimits.checked
+    }
+
+    QQC.CheckBox {
+        id: showChart
+        text: i18n("Daily spend chart (14 days)")
     }
 
     QQC.CheckBox {

@@ -26,6 +26,8 @@ come from the account endpoint, and are cached on disk between calls.
   claude-usage --limits    plan limits only
   claude-usage --no-limits skip the network call; serve cached limits only
   claude-usage --verify    reconcile computed cost against Claude Code's own
+  claude-usage --demo      synthetic JSON (for screenshots and testing);
+                           CLAUDE_USAGE_DEMO=1 does the same for the widget
 """
 import json, os, re, sys, time, glob
 import urllib.error, urllib.request
@@ -36,9 +38,12 @@ CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")
 BLOCK_HOURS = 5  # Claude subscription limits reset on a rolling 5h window.
 
 # USD per million tokens: (input, output, 5m cache write, 1h cache write, cache read)
-# platform.claude.com/docs/en/about-claude/pricing, verified 2026-09-02 against
-# Claude Code's own recorded costUSD figures to the cent (see --verify).
+# platform.claude.com/docs/en/about-claude/pricing, checked 2026-10-17 and
+# reconciled against Claude Code's own recorded costUSD figures (see --verify).
 PRICING = {
+    "opus-5-5":   (4.0,  20.0,  5.00,  8.0, 0.20),
+    "sonnet-5-5": (2.0,  10.0,  2.50,  4.0, 0.10),
+    "haiku-5-5":  (0.10,  0.50, 0.125, 0.20, 0.01),
     "fable-5-1":  (10.0, 50.0, 12.50, 20.0, 0.25),
     "mythos-5-1": (10.0, 50.0, 12.50, 20.0, 0.25),
     "fable-5":    (10.0, 50.0, 12.50, 20.0, 1.00),
@@ -55,8 +60,13 @@ PRICING = {
     "haiku-4-5":  (1.0,   5.0,  1.25,  2.0, 0.10),
     "haiku-3-5":  (0.80,  4.0,  1.00,  1.60, 0.08),
 }
-# Longest key first so "opus-4-5" can never shadow a longer match.
+# Longest key first so "opus-5" can never shadow "opus-5-5".
 PRICE_KEYS = sorted(PRICING, key=len, reverse=True)
+# Models billed at a higher rate once a single prompt passes a size threshold:
+# key -> (prompt tokens, rates above it).
+LONG_PROMPT = {
+    "haiku-5-5": (100_000, (0.50, 2.50, 0.625, 1.0, 0.05)),
+}
 WEB_SEARCH_USD = 0.01  # $10 per 1,000 searches
 
 
@@ -68,10 +78,30 @@ def normalise_model(model):
     return re.sub(r"-\d{8}$", "", m)
 
 
-def rate_for(model):
+# Model families drive the daily chart. The order is fixed so a family keeps
+# its colour in the widget no matter which families appear in a given window.
+FAMILIES = ("opus", "sonnet", "haiku", "fable", "other")
+
+
+def family(model):
+    m = (model or "").lower()
+    if "fable" in m or "mythos" in m:
+        return "fable"
+    for f in ("opus", "sonnet", "haiku"):
+        if f in m:
+            return f
+    return "other"
+
+
+def rate_for(model, prompt_tokens=0):
+    """Per-MTok rates for a model; `prompt_tokens` (input + cache writes +
+    cache reads of one request) selects a long-prompt tier where one exists."""
     m = (model or "").lower()
     for k in PRICE_KEYS:
         if k in m:
+            long = LONG_PROMPT.get(k)
+            if long and prompt_tokens > long[0]:
+                return long[1]
             return PRICING[k]
     return None
 
@@ -94,8 +124,9 @@ def parse_ts(ts):
 
 
 def collect():
-    """Return (timestamped turns, per-session cost-state records)."""
-    seen, rows, states, unpriced = set(), [], {}, set()
+    """Return (timestamped turns, per-session cost-state records, unpriced
+    models, per-session titles)."""
+    seen, rows, states, unpriced, titles = set(), [], {}, set(), {}
     for path in glob.glob(os.path.join(CLAUDE_DIR, "projects", "**", "*.jsonl"),
                           recursive=True):
         project = os.path.basename(os.path.dirname(path))
@@ -105,11 +136,18 @@ def collect():
             continue
         with fh:
             for line in fh:
-                if '"usage"' not in line and '"cost-state"' not in line:
+                if ('"usage"' not in line and '"cost-state"' not in line
+                        and '"ai-title"' not in line):
                     continue
                 try:
                     d = json.loads(line)
                 except ValueError:
+                    continue
+
+                if d.get("type") == "ai-title":
+                    # Claude Code retitles as the session goes; keep the latest.
+                    if d.get("sessionId") and d.get("aiTitle"):
+                        titles[d["sessionId"]] = str(d["aiTitle"])
                     continue
 
                 if d.get("type") == "cost-state":
@@ -146,7 +184,7 @@ def collect():
                 think = (u.get("output_tokens_details") or {}).get("thinking_tokens") or 0
                 searches = (u.get("server_tool_use") or {}).get("web_search_requests") or 0
 
-                r = rate_for(model)
+                r = rate_for(model, inp + w5 + w1h + read)
                 if r:
                     pin, pout, p5, p1h, pread = r
                     cost = (inp * pin + out * pout + w5 * p5 + w1h * p1h
@@ -158,13 +196,14 @@ def collect():
 
                 rows.append({
                     "t": when, "model": model, "project": project,
+                    "cwd": d.get("cwd"),
                     "session": d.get("sessionId") or d.get("session_id"),
                     "u": {"input": inp, "output": out, "cache_write": w5 + w1h,
                           "cache_read": read, "thinking": think, "cost": cost,
                           "messages": 1, "web_searches": searches},
                 })
     rows.sort(key=lambda r: r["t"])
-    return rows, states, sorted(unpriced)
+    return rows, states, sorted(unpriced), titles
 
 # ------------------------------------------------------------- plan limits
 # Subscription limits come from the same endpoint Claude Code's own /usage
@@ -183,6 +222,9 @@ LIMITS_TTL = int(os.environ.get("CLAUDE_USAGE_LIMITS_TTL") or 120)
 
 LIMIT_LABELS = {"session": "Session", "weekly_all": "Week",
                 "weekly_scoped": "Week"}
+# Window lengths, so the widget can mark how far through each window we are.
+WINDOW_MIN = {"session": BLOCK_HOURS * 60, "weekly_all": 7 * 1440,
+              "weekly_scoped": 7 * 1440}
 # Older/alternate response shape: one object per limit rather than a list.
 NAMED_LIMITS = [
     ("five_hour", "session", "Session"),
@@ -299,6 +341,7 @@ def shape_limits(raw, at, fresh):
                              if when else None,
             "severity": severity or ("critical" if pct >= 95 else
                                      "warning" if pct >= 80 else "normal"),
+            "window_min": WINDOW_MIN.get(kind),
             "active": bool(active) if active is not None else None,
         })
 
@@ -357,24 +400,30 @@ def block_bounds(rows, now):
 
 
 def summarise(limits=True):
-    rows, states, unpriced = collect()
+    rows, states, unpriced, titles = collect()
     now = datetime.now().astimezone()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
     buckets = {k: blank() for k in ("today", "week", "month", "total")}
     by_day, by_session, tx_models = (defaultdict(blank), defaultdict(blank),
                                      defaultdict(blank))
-    last_seen, session_project = {}, {}
+    last_seen, session_project, session_cwd, session_model = {}, {}, {}, {}
+    day_family = defaultdict(lambda: defaultdict(float))
 
     for r in rows:
         u = r["u"]
         add(buckets["total"], u)
         add(tx_models[r["model"]], u)
         add(by_day[r["t"].strftime("%Y-%m-%d")], u)
+        day_family[r["t"].strftime("%Y-%m-%d")][family(r["model"])] += u["cost"]
         if r["session"]:
             add(by_session[r["session"]], u)
             last_seen[r["session"]] = r["t"]
             session_project[r["session"]] = r["project"]
+            if r.get("cwd"):
+                session_cwd[r["session"]] = r["cwd"]
+            if r["model"] not in ("<synthetic>", "unknown"):
+                session_model[r["session"]] = r["model"]
         if r["t"] >= midnight:
             add(buckets["today"], u)
         if r["t"] >= now - timedelta(days=7):
@@ -434,15 +483,31 @@ def summarise(limits=True):
 
     # --- recent sessions
     sessions = []
-    for sid, t in sorted(last_seen.items(), key=lambda kv: kv[1], reverse=True)[:6]:
+    for sid, t in sorted(last_seen.items(), key=lambda kv: kv[1], reverse=True)[:8]:
         st = states.get(sid)
         cost = st["totalCostUSD"] if st and st.get("totalCostUSD") else by_session[sid]["cost"]
+        cwd = session_cwd.get(sid)
         sessions.append({
             "id": sid, "project": session_project.get(sid, "?"),
+            "title": titles.get(sid),
+            "cwd": cwd,
+            "dir": (os.path.basename(cwd.rstrip("/")) or "/") if cwd else None,
+            "model": session_model.get(sid),
             "cost": round(cost, 4), "tokens": tokens_of(by_session[sid]),
             "last": t.isoformat(),
+            "ago_min": int(max(0, (now - t).total_seconds()) // 60),
             "active": bool(start and t >= start),
         })
+
+    # --- last 14 days, split by model family, oldest first
+    daily = []
+    for i in range(13, -1, -1):
+        d = (midnight - timedelta(days=i))
+        key = d.strftime("%Y-%m-%d")
+        fam = {f: round(day_family[key].get(f, 0.0), 4) for f in FAMILIES}
+        daily.append({"date": key, "label": d.strftime("%-d %b"),
+                      "weekday": d.strftime("%a"), "cost": round(sum(fam.values()), 4),
+                      "families": fam})
 
     return {
         "generated": now.isoformat(),
@@ -455,6 +520,8 @@ def summarise(limits=True):
                    sorted(models.items(), key=lambda kv: -kv[1]["cost"])},
         "sessions": sessions,
         "by_day": {k: pack(by_day[k]) for k in sorted(by_day, reverse=True)},
+        "daily": daily,
+        "families": list(FAMILIES),
         "session_count": len(set(last_seen) | set(states)),
         "first_seen": rows[0]["t"].isoformat() if rows else None,
         "unpriced_models": unpriced,
@@ -481,7 +548,7 @@ def human(n):
 
 def verify():
     """Recompute every cost-state entry from its own token counts."""
-    _, states, _ = collect()
+    _, states, _, _ = collect()
     rec_tot = calc_tot = 0.0
     bad = 0
     print("\n\033[1mReconciliation against Claude Code's recorded costs\033[0m\n")
@@ -491,21 +558,31 @@ def verify():
             if not r:
                 print(f"  \033[33mno price data\033[0m  {name}")
                 continue
-            pin, pout, _p5, p1h, pread = r
-            calc = (m["inputTokens"] * pin + m["outputTokens"] * pout
-                    + m["cacheCreationInputTokens"] * p1h
+            pin, pout, p5, p1h, pread = r
+            # cost-state does not split cache writes by TTL, so the true cost
+            # lies between "all 5m writes" and "all 1h writes".
+            base = (m["inputTokens"] * pin + m["outputTokens"] * pout
                     + m["cacheReadInputTokens"] * pread) / 1e6
-            calc += m.get("webSearchRequests", 0) * WEB_SEARCH_USD
+            base += m.get("webSearchRequests", 0) * WEB_SEARCH_USD
+            lo = base + m["cacheCreationInputTokens"] * p5 / 1e6
+            calc = base + m["cacheCreationInputTokens"] * p1h / 1e6
             rec = m.get("costUSD", 0.0)
             rec_tot += rec
             calc_tot += calc
-            ok = abs(calc - rec) < max(0.005, rec * 0.01)
+            tol = max(0.005, rec * 0.01)
+            exact = abs(calc - rec) < tol
+            mixed = not exact and lo - tol <= rec <= calc + tol
+            ok = exact or mixed
             bad += not ok
-            print(f"  {'\033[32mok  \033[0m' if ok else '\033[31mDIFF\033[0m'} "
-                  f"{name:<28} recorded ${rec:>9.4f}  computed ${calc:>9.4f}")
+            tag = ('\033[32mok  \033[0m' if exact else
+                   '\033[32mmix \033[0m' if mixed else '\033[31mDIFF\033[0m')
+            print(f"  {tag} {name:<28} recorded ${rec:>9.4f}  computed ${calc:>9.4f}"
+                  + (f"  \033[2m(5m-1h range ${lo:,.2f}-${calc:,.2f})\033[0m" if mixed else ""))
     delta = calc_tot - rec_tot
-    print(f"\n  total recorded ${rec_tot:,.4f}   computed ${calc_tot:,.4f}"
+    print(f"\n  total recorded ${rec_tot:,.4f}   computed (1h writes) ${calc_tot:,.4f}"
           f"   delta ${delta:+.4f}")
+    print("  \033[2mmix = recorded cost sits between the all-5m and all-1h cache-write"
+          " prices, i.e. the session used both TTLs\033[0m")
     print(f"  \033[{'32m' if not bad else '31m'}{'all entries match' if not bad else str(bad) + ' mismatched'}\033[0m\n")
     return 1 if bad else 0
 
@@ -608,8 +685,78 @@ def report(s, daily_days=0):
     print()
 
 
+def demo():
+    """Plausible synthetic output, so screenshots never leak real projects."""
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def at(mins):
+        return (now + timedelta(minutes=mins)).isoformat()
+
+    def lim(kind, label, pct, mins):
+        when = now + timedelta(minutes=mins)
+        return {"kind": kind, "label": label, "pct": pct, "resets_at": when.isoformat(),
+                "resets_at_local": when.strftime("%H:%M"), "resets_day": when.strftime("%a"),
+                "resets_in_min": mins, "window_min": WINDOW_MIN[kind],
+                "severity": "critical" if pct >= 95 else "warning" if pct >= 80 else "normal",
+                "active": kind == "session"}
+
+    def u(cost, tokens, msgs=0):
+        return {"input": tokens // 400, "output": tokens // 60, "cache_write": tokens // 25,
+                "cache_read": tokens - tokens // 400 - tokens // 60 - tokens // 25,
+                "thinking": tokens // 200, "cost": cost, "messages": msgs,
+                "web_searches": 0, "tokens": tokens}
+
+    pattern = [(3.1, 0.4, 0.05), (0, 0, 0), (8.6, 1.2, 0.1), (12.4, 0.0, 0.2), (6.2, 2.1, 0.1),
+               (0.0, 0.0, 0.0), (4.4, 0.0, 0.1), (15.8, 0.9, 0.2), (9.7, 0.0, 0.1), (11.2, 3.4, 0.2),
+               (2.3, 0.0, 0.0), (7.9, 0.6, 0.1), (13.5, 1.1, 0.2), (10.4, 0.8, 0.1)]
+    daily = []
+    for i, (o, s_, h) in enumerate(pattern):
+        d = midnight - timedelta(days=13 - i)
+        fam = {"opus": o, "sonnet": s_, "haiku": h, "fable": 0.0, "other": 0.0}
+        daily.append({"date": d.strftime("%Y-%m-%d"), "label": d.strftime("%-d %b"),
+                      "weekday": d.strftime("%a"), "cost": round(sum(fam.values()), 4),
+                      "families": fam})
+    today, week = daily[-1]["cost"], sum(x["cost"] for x in daily[-7:])
+    sessions = [
+        ("Refactor the storage layer", "orbit-api", "claude-opus-5-5", 4.82, 3, True),
+        ("Fix flaky websocket tests", "orbit-web", "claude-opus-5-5", 2.37, 18, True),
+        ("Write release notes for 2.4", "orbit-docs", "claude-sonnet-5-5", 0.64, 95, False),
+        ("Profile the image pipeline", "lumen", "claude-opus-5-5", 3.91, 260, False),
+        ("Add CSV export to reports", "ledger", "claude-sonnet-5-5", 1.12, 1440, False),
+    ]
+    return {
+        "generated": now.isoformat(), "block_hours": BLOCK_HOURS,
+        "limits": {"ok": True, "fresh": True, "stale": False, "fetched": now.isoformat(),
+                   "age_sec": 12, "plan": "Max · Max 5x", "credits": None,
+                   "entries": [lim("session", "Session", 46.0, 128),
+                               lim("weekly_all", "Week", 58.0, 2 * 1440 + 310),
+                               lim("weekly_scoped", "Week (Sonnet)", 21.0, 2 * 1440 + 310)]},
+        "block": dict(u(7.86, 9_400_000, 61), active=True, start=at(-172), end=at(128),
+                      remaining_min=128, time_pct=57.3, burn_tokens_per_min=54_600,
+                      burn_cost_per_hour=2.74, projected_cost=13.71),
+        "today": u(today, 14_100_000, 112), "week": u(week, 71_500_000, 640),
+        "month": u(week * 3.6, 251_000_000, 2210), "total": u(week * 5.1, 352_000_000, 3105),
+        "models": {"claude-opus-5-5": u(week * 4.4, 300_000_000), "claude-sonnet-5-5": u(week * 0.55, 41_000_000),
+                   "claude-haiku-5-5": u(week * 0.15, 11_000_000)},
+        "sessions": [{"id": "demo-%d" % i, "project": "-demo-" + d, "title": t,
+                      "cwd": "/home/you/code/" + d, "dir": d, "model": m, "cost": c,
+                      "tokens": int(c * 1_300_000), "last": at(-a), "ago_min": a, "active": act}
+                     for i, (t, d, m, c, a, act) in enumerate(sessions)],
+        "by_day": {}, "daily": daily, "families": list(FAMILIES),
+        "session_count": 87, "first_seen": (now - timedelta(days=40)).isoformat(),
+        "unpriced_models": [],
+    }
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if "--demo" in args or os.environ.get("CLAUDE_USAGE_DEMO") == "1":
+        if "--text" in args or "--daily" in args:
+            report(demo(), daily_days=14 if "--daily" in args else 0)
+        else:
+            print(json.dumps(demo(), separators=(",", ":")))
+        sys.exit(0)
     if "--verify" in args:
         sys.exit(verify())
     if "--limits" in args:

@@ -26,6 +26,9 @@
     <entry name="showLimitInPanel" type="Bool">
       <default>true</default>
     </entry>
+    <entry name="showChart" type="Bool">
+      <default>true</default>
+    </entry>
     <entry name="showModels" type="Bool">
       <default>true</default>
     </entry>
